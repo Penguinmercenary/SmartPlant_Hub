@@ -22,6 +22,13 @@
 #include "esp_timer.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "nvs_flash.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include "secrets.h"
 
 static const char *TAG = "plant";
 
@@ -45,6 +52,8 @@ static const char *TAG = "plant";
 #define WATER_DURATION_MS      5000    /* 每次浇水 5 秒 */
 #define SOAK_TIME_MS           30000   /* 浇完等 30 秒，让水渗透再重新判断 */
 #define MIN_WATER_INTERVAL_MS  300000  /* 两次自动浇水至少间隔 5 分钟，防过度浇 */
+
+/* WiFi/微信/API key 的敏感配置在 secrets.h 里（已 gitignore，勿提交） */
 
 /* ============ I2C 句柄 ============ */
 static i2c_master_bus_handle_t bus_handle = NULL;
@@ -204,6 +213,87 @@ static int64_t ws_time = 0;          /* 当前状态起始时间(ms) */
 static int64_t last_water_ms = -MIN_WATER_INTERVAL_MS;  /* 负数=还没浇过水，开机可立即浇第一次 */
 static bool pump_on = false;
 
+/* ============ 微信推送（企业微信群机器人） ============ */
+static void wecom_send(const char *content)
+{
+    char post_data[512];
+    snprintf(post_data, sizeof(post_data),
+             "{\"msgtype\":\"text\",\"text\":{\"content\":\"%s\"}}", content);
+
+    esp_http_client_config_t cfg = {
+        .url = WECOM_WEBHOOK,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 10000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type", "application/json; charset=utf-8");
+    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "微信推送成功 HTTP %d", esp_http_client_get_status_code(client));
+    } else {
+        ESP_LOGE(TAG, "微信推送失败: %s", esp_err_to_name(err));
+    }
+    esp_http_client_cleanup(client);
+}
+
+/* TLS 握手很吃栈，主任务栈不够，用一个大栈的独立任务来发 */
+static void wecom_send_task(void *arg)
+{
+    wecom_send((const char *)arg);
+    vTaskDelete(NULL);
+}
+
+static void wecom_send_async(const char *content)
+{
+    xTaskCreate(wecom_send_task, "wecom", 12288, (void *)content, 5, NULL);
+}
+
+/* ============ WiFi ============ */
+static volatile bool wifi_connected = false;
+static bool wecom_boot_sent = false;
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi 断开，重连中...");
+        wifi_connected = false;
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "WiFi 已连接！");
+        wifi_connected = true;
+    }
+}
+
+static void wifi_init_sta(void)
+{
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);   /* 关闭省电模式：手机热点容易把省电的 ESP32 踢掉 */
+    ESP_LOGI(TAG, "WiFi 连接中 (SSID=%s)...", WIFI_SSID);
+}
+
 /* ============ 主程序 ============ */
 void app_main(void)
 {
@@ -251,9 +341,17 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "扫描完成，期望看到 0x3C(OLED) 0x44(SHT30) 0x48(ADS1115)");
 
+    wifi_init_sta();   /* 连 WiFi，连上后会给微信发"花盆上线" */
+
     ESP_LOGI(TAG, "P0 auto-water loop start, threshold=%d mV", SOIL_DRY_THRESHOLD_MV);
 
     while (1) {
+        /* 0. 连上 WiFi 后，发一次"花盆上线"到微信 */
+        if (wifi_connected && !wecom_boot_sent) {
+            wecom_send_async("主人，花盆上线啦！");
+            wecom_boot_sent = true;
+        }
+
         /* 1. 读传感器 */
         float t = 0.0f, h = 0.0f;
         esp_err_t err_sht = sht30_read(&t, &h);

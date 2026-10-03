@@ -76,3 +76,6 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# 敏感配置（WiFi 密码 / 微信 webhook / API key），绝对不能提交
+secrets.h
